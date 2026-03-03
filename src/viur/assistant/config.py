@@ -15,6 +15,9 @@ class AssistantConfig(ConfigType):
     api_anthropic_key: str = None
     """API Key for Anthropic"""
 
+    default_provider: t.Literal["openai", "anthropic"] = "openai"
+    """Default LLM provider to use"""
+
     language_map: t.Dict[str, str] = {
         "de": "German",
         "de-DE-x-simple-language": "Deutsch, einfache Sprache",

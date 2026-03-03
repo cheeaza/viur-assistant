@@ -3,18 +3,16 @@ import io
 import json
 import os
 import typing as t
-from json import JSONDecodeError
 
 import PIL
-import anthropic
-import openai
-from openai.types import ChatModel
-from openai.types.chat import ChatCompletionMessageParam
 from viur.core import conf, current, db, errors, exposed, utils
 from viur.core.decorators import access, force_post
 from viur.core.prototypes import List, Singleton, Tree
 
 from viur.assistant.config import ASSISTANT_LOGGER, CONFIG
+from viur.assistant.llm.openai_provider import OpenAIProvider
+from viur.assistant.llm.anthropic_provider import AnthropicProvider
+from viur.assistant.llm.provider import LLMProviderInterface, LLMRequest, LLMMessage
 
 logger = ASSISTANT_LOGGER.getChild(__name__)
 
@@ -51,6 +49,27 @@ class Assistant(Singleton):
     """
     kindName: t.Final[str] = "viur-assistant"
 
+    def _get_provider(self, provider_type: str | None = None) -> LLMProviderInterface:
+        """
+        Returns the LLM provider instance based on the configuration or specified type.
+        """
+        if not provider_type:
+            if skel := self.getContents():
+                provider_type = skel["provider"]
+            else:
+                provider_type = CONFIG.default_provider
+
+        if provider_type == "openai":
+            if not CONFIG.api_openai_key:
+                raise errors.InternalServerError(descr="OpenAI API Key is missing")
+            return OpenAIProvider(api_key=CONFIG.api_openai_key)
+        elif provider_type == "anthropic":
+            if not CONFIG.api_anthropic_key:
+                raise errors.InternalServerError(descr="Anthropic API Key is missing")
+            return AnthropicProvider(api_key=CONFIG.api_anthropic_key)
+
+        raise errors.InternalServerError(descr=f"Unsupported LLM provider: {provider_type}")
+
     @exposed
     @access("admin")
     @force_post
@@ -65,7 +84,7 @@ class Assistant(Singleton):
         """
         Generates a script based on a user prompt and optional module structures using a language model.
 
-        This method builds a structured prompt for the LLM Anthropic Claude and optionally includes
+        This method builds a structured prompt for the LLM and optionally includes
         application-specific module metadata to enrich the generation context. Additional configuration
         such as caching behavior and token budgeting for "thinking steps" can be provided.
 
@@ -85,45 +104,39 @@ class Assistant(Singleton):
           - If the LLM request fails due to connection or model errors.
 
         .. note::
-         - Requires a valid `anthropic_model` configuration in the current context.
+         - Requires a valid configuration in the current context.
          - The actual parsing of the generated code (e.g., extracting specific script content)
            is currently marked as a TODO and has to be discussed.
         """
         if not (skel := self.getContents()):
             raise errors.InternalServerError(descr="Configuration missing")
 
-        llm_params = {
-            "model": skel["anthropic_model"],
-            "max_tokens": skel["anthropic_max_tokens"] + max_thinking_tokens,
-            "temperature": skel["anthropic_temperature"],
-            "system": [{
-                "type": "text",
-                "text": skel["anthropic_system_prompt"]
-            }],
-            "messages": [{
-                "role": "user",
-                "content": (user_content := []),
-            }]
-        }
+        provider = self._get_provider()
+        provider_type = skel["provider"]
 
-        # add docs to system prompt (with or without caching), should be delivered by scriptor package
-        scriptor_doc_system_param = {
-            "type": "text",
-            "text": "",  # TODO: scriptor docs
-        }
-        # TODO: llm_params["system"].append(scriptor_doc_system_param)
-        if enable_caching:
-            scriptor_doc_system_param["cache_control"] = {"type": "ephemeral"}
+        request = LLMRequest(
+            model=skel[f"{provider_type}_model"],
+            temperature=skel[f"{provider_type}_temperature"],
+            system_prompt=skel[f"{provider_type}_system_prompt"],
+        )
 
-        # thinking configuration
-        if max_thinking_tokens > 0:
-            llm_params["thinking"] = {
-                "type": "enabled",
-                # TODO: "budget_tokens": min(max_thinking_tokens, skel["anthropic_max_thinking_tokens"])
-                "budget_tokens": max_thinking_tokens,
-            }
+        if provider_type == "anthropic":
+            request.max_tokens = skel["anthropic_max_tokens"] + max_thinking_tokens
+            if max_thinking_tokens > 0:
+                request.extra_params["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": max_thinking_tokens,
+                }
+            # Handle caching (Anthropic specific)
+            if enable_caching:
+                # This might need more complex structure if we want to cache specific parts
+                # For now we keep it simple as it was
+                pass
+        else:
+            request.max_tokens = skel.get("openai_max_tokens", 1024)
 
         # add module structures
+        user_content = []
         if modules_to_include is not None and (structures := self.get_viur_structures(modules_to_include)):
             user_content.append({
                 "type": "text",
@@ -138,16 +151,25 @@ class Assistant(Singleton):
             "text": prompt
         })
 
-        anthropic_client = anthropic.Anthropic(api_key=CONFIG.api_anthropic_key)
-        logger.debug(f"{llm_params=}")
+        request.messages = [LLMMessage(role="user", content=user_content)]
+
         try:
-            message = anthropic_client.messages.create(**llm_params)
+            response = provider.generate_response(request)
         except Exception as e:
             logger.exception(e)
             raise errors.InternalServerError(descr=str(e))
-        logger.debug(f"{message=}")
+
+        logger.debug(f"{response=}")
         current.request.get().response.headers["Content-Type"] = "application/json"
-        return message.model_dump_json()  # TODO: parse real "code" value
+
+        if provider_type == "anthropic":
+            # Return raw-like dump for backward compatibility if needed,
+            # but usually we want to return the content.
+            # The previous code returned message.model_dump_json()
+            if hasattr(response.raw_response, "model_dump_json"):
+                return response.raw_response.model_dump_json()
+
+        return json.dumps({"code": response.content})
 
     def get_viur_structures(self, modules_to_include: t.Iterable[str]) -> dict[str, dict]:
         """
@@ -199,7 +221,7 @@ class Assistant(Singleton):
         """
         Translate a given text into a target language, optionally using a specific style.
 
-        This method sends the input text to OpenAI with instructions to
+        This method sends the input text to the LLM with instructions to
         translate it into the requested language, optionally applying predefined translation
         characteristics such as simplification.
 
@@ -223,20 +245,52 @@ class Assistant(Singleton):
             *CONFIG.translate_language_characteristics.get(characteristic, []),
         ]
 
-        message = self.openai_create_completion(
-            model=skel["openai_model"],
-            messages=[{  # type: ignore (typed dict)
-                "role": "user",
-                "content": (
+        provider = self._get_provider()
+        provider_type = skel["provider"]
+
+        request = LLMRequest(
+            model=skel[f"{provider_type}_model"],
+            messages=[LLMMessage(
+                role="user",
+                content=(
                     f"Translate the following text into {CONFIG.language_map.get(language, language)}"
-                    f" ({". ".join(characteristics)})"
+                    f" ({'. '.join(characteristics)})"
                     f" and only return the translation, keep HTML-tags (if there are any):\n\n{text}\n"
                 )
-            }],
-            stop=None,
+            )]
         )
 
-        return self.render_text(message)
+        if provider_type == "openai":
+            # For translation we use a simpler schema or plain text.
+            # The original code used a complex schema in openai_create_completion.
+            # But let's keep it simple here if possible, or use extra_params.
+            request.extra_params["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "viur-assistant-translation",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "answer": {"type": "string"}
+                        },
+                        "required": ["answer"],
+                        "additionalProperties": False
+                    },
+                    "strict": True
+                }
+            }
+
+        response = provider.generate_response(request)
+        content = response.content
+
+        if provider_type == "openai":
+            try:
+                data = json.loads(content)
+                content = data["answer"]
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        return self.render_text(content)
 
     @exposed
     @access("admin", "file-view")
@@ -249,10 +303,10 @@ class Assistant(Singleton):
         language: str | None = None,
     ):
         """
-        Generate an HTML ``alt`` attribute description for a given image using OpenAi.
+        Generate an HTML ``alt`` attribute description for a given image using LLM.
 
         This method reads an image via its filekey, resizes it to a configured pixel target,
-        and sends it along with optional prompt and context data to an OpenAI model.
+        and sends it along with optional prompt and context data to a model.
         The model returns a plain-text alternative description for accessibility purposes,
         formatted as an HTML ``alt`` text in the specified language.
 
@@ -269,7 +323,7 @@ class Assistant(Singleton):
 
         .. note::
           - The image is resized and converted to JPEG before being sent to the model.
-          - This function uses a preconfigured OpenAI model, pixel count, and JPEG quality settings.
+          - This function uses a preconfigured model, pixel count, and JPEG quality settings.
         """
         if not (skel := self.getContents()):
             raise errors.InternalServerError(descr="Configuration missing")
@@ -292,41 +346,87 @@ class Assistant(Singleton):
         if context or prompt:
             context_prompt = (
                 f"Use the following data as additional information to describe the image:\n"
-                # TODO: ??? f" {re.sub(r"[^a-zA-Z0-9 _-]", "", context)}\n\n"
                 f" {prompt}\n\n{context}"
             )
 
-        content = [
-            {
-                "type": "text",
-                "text": (
-                    f"Analyze the image and generate an appropriate HTML alt attribute"
-                    f" in language: {CONFIG.language_map.get(language, language)}."
-                    f" Provide only the plain text for the alt attributes without quotes and label.\n\n"
-                    f"{context_prompt}\n"
-                ),
-            },
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{base64_image}",
-                    # "url": "http://some-domain.com/image.jpeg",
-                    "detail": "low",
-                    # "low" = 85 Tokens, "high" = calulated differently
-                    # "low" = resize (on openapis side) to < 512x512px
-                    # https://platform.openai.com/docs/guides/images?api-mode=chat#calculating-costs
-                },
-            },
-        ]
+        provider = self._get_provider()
+        provider_type = skel["provider"]
 
-        message = self.openai_create_completion(
-            model=skel["openai_model"],
-            messages=[{  # type: ignore (typed dict)
-                "role": "user",
-                "content": content,
-            }],
+        if provider_type == "openai":
+            content = [
+                {
+                    "type": "text",
+                    "text": (
+                        f"Analyze the image and generate an appropriate HTML alt attribute"
+                        f" in language: {CONFIG.language_map.get(language, language)}."
+                        f" Provide only the plain text for the alt attributes without quotes and label.\n\n"
+                        f"{context_prompt}\n"
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{base64_image}",
+                        "detail": "low",
+                    },
+                },
+            ]
+        elif provider_type == "anthropic":
+            content = [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": base64_image,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        f"Analyze the image and generate an appropriate HTML alt attribute"
+                        f" in language: {CONFIG.language_map.get(language, language)}."
+                        f" Provide only the plain text for the alt attributes without quotes and label.\n\n"
+                        f"{context_prompt}\n"
+                    ),
+                }
+            ]
+        else:
+            raise errors.InternalServerError(f"Image description not supported for {provider_type}")
+
+        request = LLMRequest(
+            model=skel[f"{provider_type}_model"],
+            messages=[LLMMessage(role="user", content=content)]
         )
-        return self.render_text(message)
+
+        if provider_type == "openai":
+            request.extra_params["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "viur-assistant-image-desc",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "answer": {"type": "string"}
+                        },
+                        "required": ["answer"],
+                        "additionalProperties": False
+                    },
+                    "strict": True
+                }
+            }
+
+        response = provider.generate_response(request)
+        content = response.content
+
+        if provider_type == "openai":
+            try:
+                data = json.loads(content)
+                content = data["answer"]
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        return self.render_text(content)
 
     def _get_resized_image_bytes(
         self,
@@ -388,67 +488,6 @@ class Assistant(Singleton):
         result_bio.seek(0)
         return result_bio.read()
 
-    def openai_create_completion(
-        self,
-        *,
-        model: str | ChatModel,
-        messages: t.Iterable[ChatCompletionMessageParam],
-        **kwargs
-    ):
-        """
-        Creates a model response in a new chat conversation.
-
-        Uses OpenAI API and structured JSON format,
-        see https://platform.openai.com/docs/guides/structured-outputs?api-mode=responses#json-mode .
-
-        :param model: Model ID used to generate the response, like gpt-4o or o3.
-        :param messages: A list of messages comprising the conversation.
-        :param kwargs: Additional arguments passing to the client.
-        :return: The response in plain text on success.
-
-        :raises errors.HTTPException: If an API error occurs.
-        """
-        client = openai.Client(api_key=CONFIG.api_openai_key)
-        try:
-            response = client.chat.completions.create(  # type: ignore
-                model=model,
-                messages=messages,
-                n=kwargs.pop("n", 1),  # How many chat completion choices
-                response_format=kwargs.pop("response_format", {  # type: ignore (typed dict)
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "viur-assistant",
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "answer": {"type": "string"}
-                            },
-                            "required": ["answer"],
-                            "additionalProperties": False
-                        },
-                        "strict": True
-                    }
-                }),
-                **kwargs
-            )
-        except openai.APIConnectionError as e:
-            logger.error(f"OpenAI API error: {e}")
-            raise errors.ServiceUnavailable(descr=str(e)) from e
-        except openai.RateLimitError as e:
-            logger.error(f"OpenAI API rate-limit reached: {e}")
-            current.request.get().response.headers["Retry-After"] = e.response.headers.get("Retry-After", "60")
-            raise errors.HTTPException(status=e.status_code, name=e.code, descr=str(e)) from e
-        except openai.APIStatusError as e:
-            logger.error(f"OpenAI API error: [{e.status_code} {e.code}] {e}")
-            raise errors.HTTPException(status=e.status_code, name=e.code, descr=str(e)) from e
-
-        logger.debug(f"{response=}")
-        try:
-            message = json.loads(response.choices[0].message.content)
-            message = message["answer"]
-        except (JSONDecodeError, KeyError):
-            raise errors.InternalServerError("Got invalid JSON from API")
-        return message
 
     def render_text(self, text: str) -> t.Any:
         """

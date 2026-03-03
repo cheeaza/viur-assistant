@@ -15,7 +15,10 @@ class AssistantConfig(ConfigType):
     api_anthropic_key: str = None
     """API Key for Anthropic"""
 
-    default_provider: t.Literal["openai", "anthropic"] = "openai"
+    api_gemini_key: str = None
+    """API Key for Gemini"""
+
+    default_provider: t.Literal["openai", "anthropic", "gemini"] = "openai"
     """Default LLM provider to use"""
 
     language_map: t.Dict[str, str] = {

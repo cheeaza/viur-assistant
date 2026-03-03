@@ -1,12 +1,21 @@
 import typing as t
+import json
 import openai
 from viur.core import errors
 from .provider import LLMProviderInterface, LLMRequest, LLMResponse, LLMMessage
 
 
 class OpenAIProvider(LLMProviderInterface):
+    provider_type = "openai"
+
     def __init__(self, api_key: str):
         self.client = openai.OpenAI(api_key=api_key)
+
+    @classmethod
+    def from_config(cls, config: t.Any) -> "OpenAIProvider":
+        if not config.api_openai_key:
+            raise errors.InternalServerError(descr="OpenAI API Key is missing")
+        return cls(api_key=config.api_openai_key)
 
     def _convert_messages(self, messages: list[LLMMessage]) -> list[dict[str, t.Any]]:
         converted = []
@@ -17,39 +26,80 @@ class OpenAIProvider(LLMProviderInterface):
             })
         return converted
 
-    def generate_response(self, request: LLMRequest) -> LLMResponse:
-        messages = self._convert_messages(request.messages)
-        if request.system_prompt:
-            messages.insert(0, {"role": "system", "content": request.system_prompt})
+    def prepare_script_request(
+        self,
+        request: LLMRequest,
+        *,
+        skel: dict[str, t.Any],
+        max_thinking_tokens: int,
+        enable_caching: bool
+    ) -> None:
+        request.max_tokens = skel.get("openai_max_tokens", 1024)
 
-        params = {
-            "model": request.model,
-            "messages": messages,
-            "max_tokens": request.max_tokens,
-            "temperature": request.temperature,
-            "stop": request.stop_sequences,
-            **request.extra_params
+    def prepare_translation_request(self, request: LLMRequest) -> None:
+        request.extra_params["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "viur-assistant-translation",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string"}
+                    },
+                    "required": ["answer"],
+                    "additionalProperties": False
+                },
+                "strict": True
+            }
         }
-        # filter None values
-        params = {k: v for k, v in params.items() if v is not None}
 
+    def parse_translation_response(self, response: LLMResponse) -> str:
         try:
-            response = self.client.chat.completions.create(**params)
-        except openai.APIConnectionError as e:
-            raise errors.ServiceUnavailable(descr=f"OpenAI connection error: {e}") from e
-        except openai.RateLimitError as e:
-            raise errors.HTTPException(status=429, name="RateLimitError", descr=f"OpenAI rate limit: {e}") from e
-        except openai.APIStatusError as e:
-            raise errors.HTTPException(status=e.status_code, name="APIStatusError", descr=f"OpenAI error: {e}") from e
+            data = json.loads(response.content)
+            return data["answer"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return response.content
 
-        choice = response.choices[0]
-        return LLMResponse(
-            content=choice.message.content,
-            usage={
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
+    def build_image_description_content(
+        self,
+        *,
+        text: str,
+        base64_image: str
+    ) -> list[dict[str, t.Any]]:
+        return [
+            {
+                "type": "text",
+                "text": text,
             },
-            stop_reason=choice.finish_reason,
-            raw_response=response
-        )
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{base64_image}",
+                    "detail": "low",
+                },
+            },
+        ]
+
+    def prepare_image_description_request(self, request: LLMRequest) -> None:
+        request.extra_params["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "viur-assistant-image-desc",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string"}
+                    },
+                    "required": ["answer"],
+                    "additionalProperties": False
+                },
+                "strict": True
+            }
+        }
+
+    def parse_image_description_response(self, response: LLMResponse) -> str:
+        try:
+            data = json.loads(response.content)
+            return data["answer"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return response.content

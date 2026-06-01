@@ -1,7 +1,15 @@
 from __future__ import annotations
 import base64
 
-from .base import BaseProvider, ModelInfo
+from .base import BaseProvider, CompletionResult, ModelInfo
+
+
+_FINISH_REASON_MAP = {
+    "STOP": "stop",
+    "MAX_TOKENS": "length",
+    "SAFETY": "content_filter",
+    "RECITATION": "content_filter",
+}
 
 
 class GeminiProvider(BaseProvider):
@@ -11,7 +19,7 @@ class GeminiProvider(BaseProvider):
     def supports_thinking(self) -> bool:
         return True
 
-    def complete(
+    def complete_detailed(
         self,
         *,
         model: str,
@@ -21,7 +29,8 @@ class GeminiProvider(BaseProvider):
         system_prompt: str | None = None,
         max_thinking_tokens: int = 0,
         enable_caching: bool = False,
-    ) -> str:
+        response_format: str | None = None,
+    ) -> CompletionResult:
         from google import genai
         from google.genai import types
 
@@ -62,13 +71,28 @@ class GeminiProvider(BaseProvider):
             config_kwargs["thinking_config"] = types.ThinkingConfig(
                 thinking_budget=max_thinking_tokens,
             )
+        if response_format == "json":
+            config_kwargs["response_mime_type"] = "application/json"
 
         response = client.models.generate_content(
             model=model,
             contents=contents,
             config=types.GenerateContentConfig(**config_kwargs) if config_kwargs else None,
         )
-        return (response.text or "").strip()
+
+        text = (response.text or "").strip()
+        candidates = getattr(response, "candidates", None) or []
+        raw_finish = str(getattr(candidates[0], "finish_reason", "") or "") if candidates else ""
+        finish_reason = _FINISH_REASON_MAP.get(raw_finish.upper(), "stop" if raw_finish else None)
+
+        usage_meta = getattr(response, "usage_metadata", None)
+        return CompletionResult(
+            text=text,
+            finish_reason=finish_reason,
+            prompt_tokens=getattr(usage_meta, "prompt_token_count", None) if usage_meta else None,
+            completion_tokens=getattr(usage_meta, "candidates_token_count", None) if usage_meta else None,
+            total_tokens=getattr(usage_meta, "total_token_count", None) if usage_meta else None,
+        )
 
     def list_models(self) -> list[ModelInfo]:
         self._require_api_key()

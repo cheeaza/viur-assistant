@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .base import BaseProvider, ModelInfo
+from .base import BaseProvider, CompletionResult, ModelInfo
 
 
 def _to_anthropic_message(msg: dict) -> dict:
@@ -27,6 +27,13 @@ def _to_anthropic_message(msg: dict) -> dict:
     return {"role": role, "content": parts}
 
 
+_FINISH_REASON_MAP = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+}
+
+
 class AnthropicProvider(BaseProvider):
     def supports_vision(self) -> bool:
         return True
@@ -34,7 +41,7 @@ class AnthropicProvider(BaseProvider):
     def supports_thinking(self) -> bool:
         return True
 
-    def complete(
+    def complete_detailed(
         self,
         *,
         model: str,
@@ -44,9 +51,14 @@ class AnthropicProvider(BaseProvider):
         system_prompt: str | None = None,
         max_thinking_tokens: int = 0,
         enable_caching: bool = False,
-    ) -> str:
+        response_format: str | None = None,
+    ) -> CompletionResult:
         import anthropic
         client = anthropic.Anthropic(api_key=self._api_key)
+
+        system_text = system_prompt or ""
+        if response_format == "json":
+            system_text = (system_text + "\nRespond with valid JSON only.").strip()
 
         params: dict = {
             "model": model,
@@ -55,8 +67,8 @@ class AnthropicProvider(BaseProvider):
         }
         if temperature is not None:
             params["temperature"] = temperature
-        if system_prompt:
-            system_block: dict = {"type": "text", "text": system_prompt}
+        if system_text:
+            system_block: dict = {"type": "text", "text": system_text}
             if enable_caching:
                 system_block["cache_control"] = {"type": "ephemeral"}
             params["system"] = [system_block]
@@ -64,7 +76,21 @@ class AnthropicProvider(BaseProvider):
             params["thinking"] = {"type": "enabled", "budget_tokens": max_thinking_tokens}
 
         response = client.messages.create(**params)
-        return next((block.text for block in response.content if block.type == "text"), "")
+
+        text = next((block.text for block in response.content if block.type == "text"), "")
+        finish_reason = _FINISH_REASON_MAP.get(response.stop_reason or "", response.stop_reason)
+        usage = response.usage
+
+        return CompletionResult(
+            text=text,
+            finish_reason=finish_reason,
+            prompt_tokens=getattr(usage, "input_tokens", None),
+            completion_tokens=getattr(usage, "output_tokens", None),
+            total_tokens=(
+                (usage.input_tokens or 0) + (usage.output_tokens or 0)
+                if usage else None
+            ),
+        )
 
     def list_models(self) -> list[ModelInfo]:
         self._require_api_key()

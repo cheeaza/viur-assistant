@@ -1,8 +1,6 @@
 from __future__ import annotations
-import json
-from json import JSONDecodeError
 
-from .base import BaseProvider, ModelInfo
+from .base import BaseProvider, CompletionResult, ModelInfo
 
 # Only chat-completion model prefixes; extend as OpenAI releases new series.
 _CHAT_PREFIXES = ("gpt-", "o1", "o3", "o4", "chatgpt-")
@@ -12,7 +10,7 @@ class OpenAIProvider(BaseProvider):
     def supports_vision(self) -> bool:
         return True
 
-    def complete(
+    def complete_detailed(
         self,
         *,
         model: str,
@@ -22,37 +20,38 @@ class OpenAIProvider(BaseProvider):
         system_prompt: str | None = None,
         max_thinking_tokens: int = 0,
         enable_caching: bool = False,
-    ) -> str:
+        response_format: str | None = None,
+    ) -> CompletionResult:
         import openai
         client = openai.OpenAI(api_key=self._api_key)
 
         if system_prompt:
             messages = [{"role": "system", "content": system_prompt}, *messages]
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_completion_tokens=max_tokens,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "viur-assistant",
-                    "schema": {
-                        "type": "object",
-                        "properties": {"answer": {"type": "string"}},
-                        "required": ["answer"],
-                        "additionalProperties": False,
-                    },
-                    "strict": True,
-                },
-            },
-        )
+        kwargs: dict = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_completion_tokens": max_tokens,
+        }
+        if response_format == "json":
+            kwargs["response_format"] = {"type": "json_object"}
 
-        try:
-            return json.loads(response.choices[0].message.content)["answer"]
-        except (JSONDecodeError, KeyError):
-            return response.choices[0].message.content or ""
+        response = client.chat.completions.create(**kwargs)
+
+        choice = response.choices[0]
+        text = (choice.message.content or "").strip()
+        raw_finish = choice.finish_reason or ""
+        finish_reason = "length" if raw_finish == "length" else ("stop" if raw_finish == "stop" else raw_finish or None)
+
+        usage = response.usage
+        return CompletionResult(
+            text=text,
+            finish_reason=finish_reason,
+            prompt_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
+            completion_tokens=getattr(usage, "completion_tokens", None) if usage else None,
+            total_tokens=getattr(usage, "total_tokens", None) if usage else None,
+        )
 
     def list_models(self) -> list[ModelInfo]:
         self._require_api_key()

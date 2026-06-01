@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+from viur.assistant.config import CONFIG
 from .anthropic import AnthropicProvider
-from .base import BaseProvider, ModelInfo
+from .base import BaseProvider, CompletionResult, ModelInfo
 from .gemini import GeminiProvider
 from .openai import OpenAIProvider
-
-from viur.assistant.config import CONFIG
 
 
 def get_provider(provider_name: str) -> BaseProvider:
@@ -20,4 +19,5 @@ def get_provider(provider_name: str) -> BaseProvider:
             raise ValueError(f"Unknown provider: {provider_name!r}")
 
 
-__all__ = ["BaseProvider", "ModelInfo", "AnthropicProvider", "GeminiProvider", "OpenAIProvider", "get_provider"]
+__all__ = ["BaseProvider", "CompletionResult", "ModelInfo", "AnthropicProvider", "GeminiProvider", "OpenAIProvider",
+           "get_provider"]

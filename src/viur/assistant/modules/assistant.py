@@ -3,18 +3,14 @@ import io
 import json
 import os
 import typing as t
-from json import JSONDecodeError
 
 import PIL
-import anthropic
-import openai
-from openai.types import ChatModel
-from openai.types.chat import ChatCompletionMessageParam
 from viur.core import conf, current, db, errors, exposed, utils
 from viur.core.decorators import access, force_post
 from viur.core.prototypes import List, Singleton, Tree
 
 from viur.assistant.config import ASSISTANT_LOGGER, CONFIG
+from viur.assistant.providers import BaseProvider, get_provider
 
 logger = ASSISTANT_LOGGER.getChild(__name__)
 
@@ -26,17 +22,13 @@ class Assistant(Singleton):
     This class includes various AI-assisted features such as script generation,
     image description, and language-aware prompting. It is designed to be used
     in the context of a ViUR admin and integrates with services like
-    OpenAI and Anthropic.
+    OpenAI, Anthropic and Google Gemini.
 
     Responsibilities:
       - Generating backend scripts from user instructions and data models.
       - Producing accessible image descriptions (e.g., for alt attributes).
       - Translate text.
       - Managing prompt and API settings.
-
-    Integrated Services:
-      - OpenAI (e.g., GPT) for image description generation and translations.
-      - Anthropic Claude for structured script generation with reasoning capabilities.
 
     Configuration can be made in
      - this singleton skel itself.
@@ -50,6 +42,14 @@ class Assistant(Singleton):
        misconfiguration or service unavailability.
     """
     kindName: t.Final[str] = "viur-assistant"
+
+    def _get_provider_and_model(self, skel) -> tuple[BaseProvider, str]:
+        """Resolve provider and model_id from the skel's ai_model relation."""
+        dest = ((skel.get("ai_model") or {}).get("dest") or {})
+        model_id = dest.get("model_id") or ""
+        if not model_id:
+            raise errors.InternalServerError(descr="No AI model configured in assistant settings.")
+        return get_provider(dest.get("provider", "openai")), model_id
 
     @exposed
     @access("admin")
@@ -65,17 +65,16 @@ class Assistant(Singleton):
         """
         Generates a script based on a user prompt and optional module structures using a language model.
 
-        This method builds a structured prompt for the LLM Anthropic Claude and optionally includes
+        This method builds a structured prompt for the LLM and optionally includes
         application-specific module metadata to enrich the generation context. Additional configuration
         such as caching behavior and token budgeting for "thinking steps" can be provided.
 
         :param prompt: The main user instruction or query that guides the script generation.
-
         :param modules_to_include: Optional list of module names whose structures
             should be included as part of the model context.
             These are injected into the LLM prompt as JSON.
         :param enable_caching: If set to True, instructs the system to use ephemeral caching for the
-            scriptor documentation prompt section.
+            scriptor documentation prompt section (provider-dependent).
         :param max_thinking_tokens: If greater than 0, enables the model's "thinking" feature with a
             token budget for intermediate reasoning or planning steps.
         :return: A JSON-encoded string of the model's response, typically containing the generated script.
@@ -83,71 +82,47 @@ class Assistant(Singleton):
         :raises InternalServerError:
           - If configuration (`skel`) is missing.
           - If the LLM request fails due to connection or model errors.
-
-        .. note::
-         - Requires a valid `anthropic_model` configuration in the current context.
-         - The actual parsing of the generated code (e.g., extracting specific script content)
-           is currently marked as a TODO and has to be discussed.
         """
         if not (skel := self.getContents()):
             raise errors.InternalServerError(descr="Configuration missing")
 
-        llm_params = {
-            "model": skel["anthropic_model"],
-            "max_tokens": skel["anthropic_max_tokens"] + max_thinking_tokens,
-            "temperature": skel["anthropic_temperature"],
-            "system": [{
-                "type": "text",
-                "text": skel["anthropic_system_prompt"]
-            }],
-            "messages": [{
-                "role": "user",
-                "content": (user_content := []),
-            }]
-        }
-
-        # add docs to system prompt (with or without caching), should be delivered by scriptor package
-        scriptor_doc_system_param = {
-            "type": "text",
-            "text": "",  # TODO: scriptor docs
-        }
-        # TODO: llm_params["system"].append(scriptor_doc_system_param)
-        if enable_caching:
-            scriptor_doc_system_param["cache_control"] = {"type": "ephemeral"}
-
-        # thinking configuration
-        if max_thinking_tokens > 0:
-            llm_params["thinking"] = {
-                "type": "enabled",
-                # TODO: "budget_tokens": min(max_thinking_tokens, skel["anthropic_max_thinking_tokens"])
-                "budget_tokens": max_thinking_tokens,
-            }
+        messages = []
 
         # add module structures
         if modules_to_include is not None and (structures := self.get_viur_structures(modules_to_include)):
-            user_content.append({
-                "type": "text",
-                "text": json.dumps({
-                    "module_structures": structures
-                }, indent=2)
+            messages.append({
+                "role": "user",
+                "content": json.dumps({"module_structures": structures}, indent=2),
             })
 
-        # finally, append user prompt
-        user_content.append({
-            "type": "text",
-            "text": prompt
-        })
+        messages.append({"role": "user", "content": prompt})
 
-        anthropic_client = anthropic.Anthropic(api_key=CONFIG.api_anthropic_key)
-        logger.debug(f"{llm_params=}")
+        effective_thinking_tokens = 0
+        if max_thinking_tokens > 0:
+            effective_thinking_tokens = (
+                min(max_thinking_tokens, skel["max_thinking_tokens"])
+                if skel["max_thinking_tokens"]
+                else max_thinking_tokens
+            )
+
+        provider, model_id = self._get_provider_and_model(skel)
+        logger.debug(f"generate_script: {provider.__class__.__name__}, model={model_id}")
         try:
-            message = anthropic_client.messages.create(**llm_params)
+            result = provider.complete(
+                model=model_id,
+                messages=messages,
+                temperature=skel["temperature"],
+                max_tokens=skel["max_tokens"],
+                system_prompt=skel["system_prompt"],
+                max_thinking_tokens=effective_thinking_tokens,
+                enable_caching=enable_caching,
+            )
         except Exception as e:
             logger.exception(e)
             raise errors.InternalServerError(descr=str(e))
-        logger.debug(f"{message=}")
+
         current.request.get().response.headers["Content-Type"] = "application/json"
-        return message.model_dump_json()  # TODO: parse real "code" value
+        return json.dumps({"code": result})  # TODO: parse real "code" value
 
     def get_viur_structures(self, modules_to_include: t.Iterable[str]) -> dict[str, dict]:
         """
@@ -199,10 +174,6 @@ class Assistant(Singleton):
         """
         Translate a given text into a target language, optionally using a specific style.
 
-        This method sends the input text to OpenAI with instructions to
-        translate it into the requested language, optionally applying predefined translation
-        characteristics such as simplification.
-
         :param text: The source text to translate.
         :param language: The target language code (e.g. ``"de"``, ``"en"``, ``"de-x-simple"``).
         :param characteristic: Optional translation style (e.g. ``"simplified"``, ``"formal"``, etc.)
@@ -210,10 +181,6 @@ class Assistant(Singleton):
         :return: Translated text as a plain string. HTML tags from the original text are preserved.
 
         :raises InternalServerError: If configuration is missing.
-
-        .. note::
-           - The translation style is determined by merging base rules (`*`) and the selected characteristic.
-           - The returned translation contains only the translated text, with no explanation or additional formatting.
         """
         if not (skel := self.getContents()):
             raise errors.InternalServerError(descr="Configuration missing")
@@ -223,20 +190,24 @@ class Assistant(Singleton):
             *CONFIG.translate_language_characteristics.get(characteristic, []),
         ]
 
-        message = self.openai_create_completion(
-            model=skel["openai_model"],
-            messages=[{  # type: ignore (typed dict)
-                "role": "user",
-                "content": (
-                    f"Translate the following text into {CONFIG.language_map.get(language, language)}"
-                    f" ({". ".join(characteristics)})"
-                    f" and only return the translation, keep HTML-tags (if there are any):\n\n{text}\n"
-                )
-            }],
-            stop=None,
-        )
+        provider, model_id = self._get_provider_and_model(skel)
+        try:
+            result = provider.complete(
+                model=model_id,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Translate the following text into {CONFIG.language_map.get(language, language)}"
+                        f" ({'. '.join(characteristics)})"
+                        f" and only return the translation, keep HTML-tags (if there are any):\n\n{text}\n"
+                    ),
+                }],
+            )
+        except Exception as e:
+            logger.exception(e)
+            raise errors.InternalServerError(descr=str(e))
 
-        return self.render_text(message)
+        return self.render_text(result)
 
     @exposed
     @access("admin", "file-view")
@@ -249,30 +220,26 @@ class Assistant(Singleton):
         language: str | None = None,
     ):
         """
-        Generate an HTML ``alt`` attribute description for a given image using OpenAi.
-
-        This method reads an image via its filekey, resizes it to a configured pixel target,
-        and sends it along with optional prompt and context data to an OpenAI model.
-        The model returns a plain-text alternative description for accessibility purposes,
-        formatted as an HTML ``alt`` text in the specified language.
+        Generate an HTML ``alt`` attribute description for a given image.
 
         :param filekey: Key identifying the image file in the ViUR file module.
-            (Key of the :class:`file skeleton <viur.core.modules.file.FileLeafSkel>`).
-        :param prompt: Optional user-defined hint or instruction for how the image should be interpreted.
-        :param context: Optional additional background information to support a better description.
-        :param language: Target language code for the generated description (e.g., ``"en"``, ``"de-x-simple"``).
-            Falls back to the current session language if not specified.
-        :return: A plain-text string suitable for use in an HTML ``alt`` attribute (no quotes or labels).
+        :param prompt: Optional user-defined hint for how the image should be interpreted.
+        :param context: Optional additional background information.
+        :param language: Target language code. Falls back to the current session language.
+        :return: A plain-text string suitable for use in an HTML ``alt`` attribute.
 
-        :raises InternalServerError: If required configuration is missing.
+        :raises InternalServerError: If required configuration is missing or the provider
+            does not support vision.
         :raises NotFound: If the referenced image file could not be loaded.
-
-        .. note::
-          - The image is resized and converted to JPEG before being sent to the model.
-          - This function uses a preconfigured OpenAI model, pixel count, and JPEG quality settings.
         """
         if not (skel := self.getContents()):
             raise errors.InternalServerError(descr="Configuration missing")
+
+        provider, model_id = self._get_provider_and_model(skel)
+        if not provider.supports_vision():
+            raise errors.InternalServerError(
+                descr=f"{provider.__class__.__name__} does not support vision."
+            )
 
         if language is None:
             language = current.language.get()
@@ -292,41 +259,42 @@ class Assistant(Singleton):
         if context or prompt:
             context_prompt = (
                 f"Use the following data as additional information to describe the image:\n"
-                # TODO: ??? f" {re.sub(r"[^a-zA-Z0-9 _-]", "", context)}\n\n"
                 f" {prompt}\n\n{context}"
             )
 
-        content = [
-            {
-                "type": "text",
-                "text": (
-                    f"Analyze the image and generate an appropriate HTML alt attribute"
-                    f" in language: {CONFIG.language_map.get(language, language)}."
-                    f" Provide only the plain text for the alt attributes without quotes and label.\n\n"
-                    f"{context_prompt}\n"
-                ),
-            },
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{base64_image}",
-                    # "url": "http://some-domain.com/image.jpeg",
-                    "detail": "low",
-                    # "low" = 85 Tokens, "high" = calulated differently
-                    # "low" = resize (on openapis side) to < 512x512px
-                    # https://platform.openai.com/docs/guides/images?api-mode=chat#calculating-costs
-                },
-            },
-        ]
+        try:
+            result = provider.complete(
+                model=model_id,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Analyze the image and generate an appropriate HTML alt attribute"
+                                f" in language: {CONFIG.language_map.get(language, language)}."
+                                f" Provide only the plain text for the alt attributes without quotes and label.\n\n"
+                                f"{context_prompt}\n"
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}",
+                                "detail": "low",
+                                # "low" = 85 Tokens, "high" = calculated differently
+                                # "low" = resize (on OpenAI's side) to < 512x512px
+                                # https://platform.openai.com/docs/guides/images?api-mode=chat#calculating-costs
+                            },
+                        },
+                    ],
+                }],
+            )
+        except Exception as e:
+            logger.exception(e)
+            raise errors.InternalServerError(descr=str(e))
 
-        message = self.openai_create_completion(
-            model=skel["openai_model"],
-            messages=[{  # type: ignore (typed dict)
-                "role": "user",
-                "content": content,
-            }],
-        )
-        return self.render_text(message)
+        return self.render_text(result)
 
     def _get_resized_image_bytes(
         self,
@@ -337,23 +305,12 @@ class Assistant(Singleton):
         """
         Resize an image to approximately match a target total pixel count and return it as a JPEG byte stream.
 
-        The image is scaled proportionally to meet the target pixel count (width × height),
-        while preserving the original aspect ratio. If the resized dimensions would exceed
-        the original image size, no upscaling is performed. The result is encoded as a JPEG.
+        :param image: Input image as file-like object, byte string, or file path.
+        :param target_pixel_count: Desired total pixel count (width × height).
+        :param jpeg_quality: JPEG compression quality (0–100). Default is 50.
+        :return: Resized JPEG image as bytes.
 
-        :param image: Input image, provided as a file-like object, byte string, file path, or raw bytes.
-        :param target_pixel_count: Desired total number of pixels for the resized image.
-            Used to compute the new dimensions.
-        :param jpeg_quality: JPEG compression quality (0 to 100).
-            Higher values yield better image quality at the cost of file size. Default is 50.
-        :return: The resized and JPEG-compressed image as a byte stream.
-
-        :raises ValueError: If `jpeg_quality` is not in the 0–100 range or the image input is invalid.
-
-        .. note::
-         - Images in PNG, SVG, or WEBP format are automatically converted to RGB JPEG.
-         - This function is intended for preprocessing images before passing them to
-           AI models, balancing detail and data size.
+        :raises ValueError: If ``jpeg_quality`` is out of range or the image input is invalid.
         """
         if not (0 <= jpeg_quality <= 100):
             raise ValueError("jpeg_quality must be between 0 and 100")
@@ -388,74 +345,9 @@ class Assistant(Singleton):
         result_bio.seek(0)
         return result_bio.read()
 
-    def openai_create_completion(
-        self,
-        *,
-        model: str | ChatModel,
-        messages: t.Iterable[ChatCompletionMessageParam],
-        **kwargs
-    ):
-        """
-        Creates a model response in a new chat conversation.
-
-        Uses OpenAI API and structured JSON format,
-        see https://platform.openai.com/docs/guides/structured-outputs?api-mode=responses#json-mode .
-
-        :param model: Model ID used to generate the response, like gpt-4o or o3.
-        :param messages: A list of messages comprising the conversation.
-        :param kwargs: Additional arguments passing to the client.
-        :return: The response in plain text on success.
-
-        :raises errors.HTTPException: If an API error occurs.
-        """
-        client = openai.Client(api_key=CONFIG.api_openai_key)
-        try:
-            response = client.chat.completions.create(  # type: ignore
-                model=model,
-                messages=messages,
-                n=kwargs.pop("n", 1),  # How many chat completion choices
-                response_format=kwargs.pop("response_format", {  # type: ignore (typed dict)
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "viur-assistant",
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "answer": {"type": "string"}
-                            },
-                            "required": ["answer"],
-                            "additionalProperties": False
-                        },
-                        "strict": True
-                    }
-                }),
-                **kwargs
-            )
-        except openai.APIConnectionError as e:
-            logger.error(f"OpenAI API error: {e}")
-            raise errors.ServiceUnavailable(descr=str(e)) from e
-        except openai.RateLimitError as e:
-            logger.error(f"OpenAI API rate-limit reached: {e}")
-            current.request.get().response.headers["Retry-After"] = e.response.headers.get("Retry-After", "60")
-            raise errors.HTTPException(status=e.status_code, name=e.code, descr=str(e)) from e
-        except openai.APIStatusError as e:
-            logger.error(f"OpenAI API error: [{e.status_code} {e.code}] {e}")
-            raise errors.HTTPException(status=e.status_code, name=e.code, descr=str(e)) from e
-
-        logger.debug(f"{response=}")
-        try:
-            message = json.loads(response.choices[0].message.content)
-            message = message["answer"]
-        except (JSONDecodeError, KeyError):
-            raise errors.InternalServerError("Got invalid JSON from API")
-        return message
-
     def render_text(self, text: str) -> t.Any:
         """
-        Render the give text as usual for the current renderer.
-
-        If the current renderer is the JSON renderer, JSON string is returned
-        and the content-type header is also set to JSON.
+        Render the given text for the current renderer.
 
         :param text: The text to render.
         """

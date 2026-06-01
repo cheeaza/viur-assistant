@@ -13,7 +13,8 @@ if _dir not in conf.skeleton_search_path:
     )
 
 from .assistant import AssistantSkel
+from .aimodel import AimodelSkel
 
 __all__ = [
-    "AssistantSkel",
+    "AssistantSkel", "AimodelSkel"
 ]

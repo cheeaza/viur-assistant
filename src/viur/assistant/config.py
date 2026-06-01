@@ -9,8 +9,11 @@ ASSISTANT_LOGGER: logging.Logger = logging.getLogger("viur.assistant")
 class AssistantConfig(ConfigType):
     """Configuration for viur-assistant plugin."""
 
+    api_gemini_key: str = None
+    """API Key for Google Gemini"""
+
     api_openai_key: str = None
-    """API Key for OpenAi"""
+    """API Key for OpenAI"""
 
     api_anthropic_key: str = None
     """API Key for Anthropic"""

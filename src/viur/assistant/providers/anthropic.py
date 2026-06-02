@@ -1,10 +1,35 @@
+"""
+Anthropic provider implementation for viur-assistant.
+
+Translates the OpenAI-compatible message format used throughout the provider
+abstraction into Anthropic's ``messages`` API format and maps Anthropic-specific
+response fields back to the normalised :class:`~base.CompletionResult`.
+
+Supported capabilities:
+
+* Text completions via ``claude-*`` models.
+* Vision – images are converted from the ``image_url`` data-URI format to
+  Anthropic's ``image`` block with a base64 source.
+* Extended thinking – enabled when ``max_thinking_tokens > 0``.
+* Prompt caching – the system-prompt block gets ``cache_control`` when
+  ``enable_caching=True``.
+"""
+
 from __future__ import annotations
 
 from .base import BaseProvider, CompletionResult, ModelInfo
 
 
 def _to_anthropic_message(msg: dict) -> dict:
-    """Translate an OpenAI-format message to Anthropic format."""
+    """Translate an OpenAI-format message dict to Anthropic's message format.
+
+    Handles both plain-text content (``str``) and multimodal content lists.
+    ``image_url`` parts with data-URI values are converted to Anthropic's
+    ``image`` block with a ``base64`` source.
+
+    :param msg: Message dict with ``role`` and ``content`` keys in OpenAI format.
+    :returns: Equivalent message dict in Anthropic API format.
+    """
     role = msg.get("role", "user")
     content = msg.get("content")
 
@@ -27,6 +52,7 @@ def _to_anthropic_message(msg: dict) -> dict:
     return {"role": role, "content": parts}
 
 
+# Maps Anthropic stop_reason values to the normalised finish_reason vocabulary.
 _FINISH_REASON_MAP = {
     "end_turn": "stop",
     "stop_sequence": "stop",
@@ -35,6 +61,12 @@ _FINISH_REASON_MAP = {
 
 
 class AnthropicProvider(BaseProvider):
+    """LLM provider backed by the Anthropic Messages API.
+
+    Supports text, vision, extended thinking, and ephemeral prompt caching.
+    API key is read from :attr:`~viur.assistant.config.AssistantConfig.api_anthropic_key`.
+    """
+
     def supports_vision(self) -> bool:
         return True
 

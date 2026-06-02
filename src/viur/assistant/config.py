@@ -1,9 +1,27 @@
+"""
+Configuration for viur-assistant.
+
+Exposes :data:`CONFIG` (an :class:`AssistantConfig` instance) and
+:data:`ASSISTANT_LOGGER` for use throughout the package.
+
+Set API keys and behaviour in your project's ``main.py`` before the first
+request is served::
+
+    from viur.assistant import CONFIG as ASSISTANT_CONFIG
+
+    ASSISTANT_CONFIG.api_gemini_key    = secret.get("api-gemini-key")
+    ASSISTANT_CONFIG.api_openai_key    = secret.get("api-openai-key")
+    ASSISTANT_CONFIG.api_anthropic_key = secret.get("api-anthropic-key")
+"""
+
 import logging
 import typing as t
 
 from viur.core.config import ConfigType
 
 ASSISTANT_LOGGER: logging.Logger = logging.getLogger("viur.assistant")
+"""Package-wide logger.  Child loggers in sub-modules are derived from this via
+:meth:`~logging.Logger.getChild`."""
 
 
 class AssistantConfig(ConfigType):

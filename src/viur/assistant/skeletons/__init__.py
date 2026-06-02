@@ -1,3 +1,11 @@
+"""
+Skeletons for viur-assistant.
+
+Registers the package directory in ``conf.skeleton_search_path`` so that
+viur-core can discover :class:`AssistantSkel` and :class:`AimodelSkel` without
+requiring explicit project-level registration.
+"""
+
 from pathlib import Path
 
 from viur.core import conf

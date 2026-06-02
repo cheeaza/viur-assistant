@@ -1,9 +1,26 @@
+"""
+Google Gemini provider implementation for viur-assistant.
+
+Translates the OpenAI-compatible message format to Gemini's
+``google.genai.types.Content`` / ``Part`` structures and maps Gemini-specific
+response fields back to the normalised :class:`~base.CompletionResult`.
+
+Supported capabilities:
+
+* Text completions via ``gemini-*`` models.
+* Vision – ``image_url`` data-URIs are decoded and passed as ``inline_data`` blobs.
+* Extended thinking – enabled via ``ThinkingConfig`` when ``max_thinking_tokens > 0``.
+* JSON output – ``response_mime_type="application/json"`` is set when
+  ``response_format="json"``.
+"""
+
 from __future__ import annotations
 import base64
 
 from .base import BaseProvider, CompletionResult, ModelInfo
 
 
+# Maps Gemini FinishReason enum names to the normalised finish_reason vocabulary.
 _FINISH_REASON_MAP = {
     "STOP": "stop",
     "MAX_TOKENS": "length",
@@ -13,6 +30,12 @@ _FINISH_REASON_MAP = {
 
 
 class GeminiProvider(BaseProvider):
+    """LLM provider backed by the Google Gemini API (``google-genai`` SDK).
+
+    Supports text, vision, and extended thinking via ``ThinkingConfig``.
+    API key is read from :attr:`~viur.assistant.config.AssistantConfig.api_gemini_key`.
+    """
+
     def supports_vision(self) -> bool:
         return True
 

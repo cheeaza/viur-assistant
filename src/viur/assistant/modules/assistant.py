@@ -1,3 +1,20 @@
+"""
+Assistant module for viur-assistant.
+
+Provides the :class:`Assistant` singleton, which exposes LLM-powered endpoints
+for script generation, image description, and text translation. All AI calls are
+routed through the provider abstraction in :mod:`viur.assistant.providers`, so the
+underlying model (Anthropic, Gemini, OpenAI, …) is determined entirely by the
+``ai_model`` relation configured in the singleton skeleton – no code changes needed
+when switching providers.
+
+Public endpoints (all require ``admin`` access unless noted):
+
+* ``POST /assistant/generate_script`` – Generate Python code for a ViUR backend.
+* ``POST /assistant/translate``       – Translate text into a target language.
+* ``POST /assistant/describe_image``  – Generate an HTML ``alt`` attribute for an image.
+"""
+
 import base64
 import io
 import json
@@ -16,40 +33,59 @@ logger = ASSISTANT_LOGGER.getChild(__name__)
 
 
 class Assistant(Singleton):
-    """
-    Provides LLM-powered utilities within a ViUR module context.
+    """LLM-powered utility singleton for ViUR admin tooling.
 
-    This class includes various AI-assisted features such as script generation,
-    image description, and language-aware prompting. It is designed to be used
-    in the context of a ViUR admin and integrates with services like
-    OpenAI, Anthropic and Google Gemini.
+    This singleton acts as the backend for AI-assisted features in the ViUR admin
+    interface. Every endpoint delegates the actual model call to a
+    :class:`~viur.assistant.providers.base.BaseProvider` instance that is resolved
+    at request time from the ``ai_model`` relation stored in the singleton skeleton.
 
-    Responsibilities:
-      - Generating backend scripts from user instructions and data models.
-      - Producing accessible image descriptions (e.g., for alt attributes).
-      - Translate text.
-      - Managing prompt and API settings.
+    **Provider selection**
 
-    Configuration can be made in
-     - this singleton skel itself.
-     - The backend configuration `CONFIG`.
+    The provider (Anthropic / Gemini / OpenAI / …) and the concrete model are
+    determined by the ``ai_model`` RelationalBone in the skeleton, which points to
+    an entry in the ``aimodel`` kind.  The resolved ``provider`` and ``model_id``
+    fields from that entry are used to instantiate the correct
+    :class:`~viur.assistant.providers.base.BaseProvider` via
+    :func:`~viur.assistant.providers.get_provider`.
+
+    **Configuration**
+
+    Runtime settings (temperature, max tokens, system prompt, …) come from the
+    singleton skeleton itself.  API keys are read from
+    :data:`viur.assistant.config.CONFIG` which is populated in the project's
+    ``main.py``.
 
     .. note::
-       The methods in this module assumes a properly configured environment
-       with API keys and AI model settings. However, you only need to
-       configure what is actually used.
-       Error handling is included for common failure modes such as
-       misconfiguration or service unavailability.
+       Configure only what you actually use – every endpoint checks that a model
+       is configured and raises :class:`~viur.core.errors.InternalServerError`
+       with a descriptive message otherwise.
     """
+
     kindName: t.Final[str] = "viur-assistant"
 
+    # ── Internal helpers ─────────────────────────────────────────────
+
     def _get_provider_and_model(self, skel) -> tuple[BaseProvider, str]:
-        """Resolve provider and model_id from the skel's ai_model relation."""
+        """Resolve the AI provider and model ID from the skeleton's ``ai_model`` relation.
+
+        Reads ``ai_model.dest.provider`` and ``ai_model.dest.model_id`` from the
+        singleton skeleton.  Both fields must be present in the ``refKeys`` of the
+        ``ai_model`` :class:`~viur.core.bones.RelationalBone`.
+
+        :param skel: The populated singleton skeleton returned by :meth:`getContents`.
+        :returns: A ``(provider, model_id)`` tuple ready for use in a
+            :meth:`~viur.assistant.providers.base.BaseProvider.complete` call.
+        :raises InternalServerError: If no ``ai_model`` is configured or
+            ``model_id`` is empty.
+        """
         dest = ((skel.get("ai_model") or {}).get("dest") or {})
         model_id = dest.get("model_id") or ""
         if not model_id:
             raise errors.InternalServerError(descr="No AI model configured in assistant settings.")
         return get_provider(dest.get("provider", "openai")), model_id
+
+    # ── Public endpoints ─────────────────────────────────────────────
 
     @exposed
     @access("admin")
@@ -60,35 +96,35 @@ class Assistant(Singleton):
         prompt: str,
         modules_to_include: list[str] = None,
         enable_caching: bool = False,
-        max_thinking_tokens: int = 0
+        max_thinking_tokens: int = 0,
     ):
-        """
-        Generates a script based on a user prompt and optional module structures using a language model.
+        """Generate a ViUR backend script from a natural-language prompt.
 
-        This method builds a structured prompt for the LLM and optionally includes
-        application-specific module metadata to enrich the generation context. Additional configuration
-        such as caching behavior and token budgeting for "thinking steps" can be provided.
+        Builds a structured message for the configured LLM, optionally enriching
+        the context with serialised ViUR module structures, and returns the model
+        response as a JSON object ``{"code": "<generated code>"}``.
 
-        :param prompt: The main user instruction or query that guides the script generation.
-        :param modules_to_include: Optional list of module names whose structures
-            should be included as part of the model context.
-            These are injected into the LLM prompt as JSON.
-        :param enable_caching: If set to True, instructs the system to use ephemeral caching for the
-            scriptor documentation prompt section (provider-dependent).
-        :param max_thinking_tokens: If greater than 0, enables the model's "thinking" feature with a
-            token budget for intermediate reasoning or planning steps.
-        :return: A JSON-encoded string of the model's response, typically containing the generated script.
-
-        :raises InternalServerError:
-          - If configuration (`skel`) is missing.
-          - If the LLM request fails due to connection or model errors.
+        :param prompt: Natural-language instruction for the code to generate.
+        :param modules_to_include: Optional list of ViUR module names whose skeleton
+            structures are injected into the prompt as JSON, giving the model
+            knowledge of available bones and their types.
+        :param enable_caching: When ``True``, marks the documentation section of
+            the system prompt with an ephemeral cache-control header (Anthropic only).
+        :param max_thinking_tokens: Budget for extended reasoning steps.  If > 0
+            and the provider supports thinking
+            (:meth:`~viur.assistant.providers.base.BaseProvider.supports_thinking`),
+            this many tokens are reserved for internal chain-of-thought before the
+            visible response.  Capped by ``skel["max_thinking_tokens"]``.
+        :returns: JSON response ``{"code": "<result>"}`` with
+            ``Content-Type: application/json``.
+        :raises InternalServerError: If the skeleton is missing, no model is
+            configured, or the LLM call fails.
         """
         if not (skel := self.getContents()):
             raise errors.InternalServerError(descr="Configuration missing")
 
         messages = []
 
-        # add module structures
         if modules_to_include is not None and (structures := self.get_viur_structures(modules_to_include)):
             messages.append({
                 "role": "user",
@@ -125,20 +161,18 @@ class Assistant(Singleton):
         return json.dumps({"code": result})  # TODO: parse real "code" value
 
     def get_viur_structures(self, modules_to_include: t.Iterable[str]) -> dict[str, dict]:
-        """
-        Collect and return ViUR module structures for a given list of module names.
+        """Collect ViUR module structures for use as LLM context.
 
-        For each named module, its structure is extracted if it is of type ``List`` or ``Tree``.
-        ``Tree`` structures will return separate entries for ``node`` and ``leaf`` skeletons.
+        For each named module, the skeleton structure is extracted via
+        :meth:`~viur.core.prototypes.List.structure`.  :class:`~viur.core.prototypes.Tree`
+        modules return a nested dict with ``"node"`` and ``"leaf"`` keys.
+        Modules that are not found in ``conf.main_app.vi`` are silently skipped.
 
-        :param modules_to_include: List of ViUR module names to retrieve structures for.
-        :return: A dictionary mapping module names to their respective structure definitions.
-            For ``Tree`` modules, nested keys ``"node"`` and ``"leaf"`` are returned.
-
-        :raises ValueError: If a module exists but is not a supported type (i.e., not ``List`` or ``Tree``).
-
-        .. note::
-           Modules that are missing or not found are silently skipped.
+        :param modules_to_include: Iterable of ViUR module names to look up.
+        :returns: Dict mapping module names to their structure dicts.
+        :raises ValueError: If a module is found but is neither a
+            :class:`~viur.core.prototypes.List` nor a
+            :class:`~viur.core.prototypes.Tree`.
         """
         structures_from_viur = {}
         for module_name in modules_to_include:
@@ -152,7 +186,7 @@ class Assistant(Singleton):
                 if module_name not in structures_from_viur:
                     structures_from_viur[module_name] = {
                         "node": module.structure(skelType="node"),
-                        "leaf": module.structure(skelType="leaf")
+                        "leaf": module.structure(skelType="leaf"),
                     }
             else:
                 raise ValueError(
@@ -171,16 +205,26 @@ class Assistant(Singleton):
         language: str,
         characteristic: t.Optional[str] = None,
     ):
-        """
-        Translate a given text into a target language, optionally using a specific style.
+        """Translate text into a target language using the configured LLM.
+
+        Builds a translation prompt incorporating optional style characteristics
+        from :attr:`~viur.assistant.config.AssistantConfig.translate_language_characteristics`
+        and returns the translated text as-is (HTML tags are preserved).
 
         :param text: The source text to translate.
-        :param language: The target language code (e.g. ``"de"``, ``"en"``, ``"de-x-simple"``).
-        :param characteristic: Optional translation style (e.g. ``"simplified"``, ``"formal"``, etc.)
-            as defined in ``CONFIG.translate_language_characteristics``.
-        :return: Translated text as a plain string. HTML tags from the original text are preserved.
-
-        :raises InternalServerError: If configuration is missing.
+        :param language: BCP-47 language code for the target language, e.g.
+            ``"de"``, ``"en"``, ``"de-DE-x-simple-language"``.  Resolved to a
+            human-readable name via
+            :attr:`~viur.assistant.config.AssistantConfig.language_map`; falls
+            back to the raw code if not mapped.
+        :param characteristic: Optional style key from
+            :attr:`~viur.assistant.config.AssistantConfig.translate_language_characteristics`,
+            e.g. ``"simple"``.  Its rules are merged with the always-active ``"*"``
+            base rules.
+        :returns: Translated text rendered for the current renderer
+            (plain text for HTML, JSON-encoded string for JSON renderer).
+        :raises InternalServerError: If the skeleton is missing, no model is
+            configured, or the LLM call fails.
         """
         if not (skel := self.getContents()):
             raise errors.InternalServerError(descr="Configuration missing")
@@ -219,18 +263,31 @@ class Assistant(Singleton):
         context: str = "",
         language: str | None = None,
     ):
-        """
-        Generate an HTML ``alt`` attribute description for a given image.
+        """Generate an HTML ``alt`` attribute description for an image file.
 
-        :param filekey: Key identifying the image file in the ViUR file module.
-        :param prompt: Optional user-defined hint for how the image should be interpreted.
-        :param context: Optional additional background information.
-        :param language: Target language code. Falls back to the current session language.
-        :return: A plain-text string suitable for use in an HTML ``alt`` attribute.
+        Reads the image from the ViUR file module, resizes it to the configured
+        target pixel count (see
+        :attr:`~viur.assistant.config.AssistantConfig.describe_image_pixel_default`)
+        to reduce token cost, encodes it as base64 JPEG, and sends it to the
+        configured vision-capable LLM.
 
-        :raises InternalServerError: If required configuration is missing or the provider
-            does not support vision.
-        :raises NotFound: If the referenced image file could not be loaded.
+        The provider must support vision
+        (:meth:`~viur.assistant.providers.base.BaseProvider.supports_vision`);
+        an :class:`~viur.core.errors.InternalServerError` is raised otherwise.
+
+        :param filekey: Key of the
+            :class:`~viur.core.modules.file.FileLeafSkel` entry to describe.
+        :param prompt: Optional hint for the model, e.g. ``"Focus on the product,
+            ignore the background."``.
+        :param context: Optional additional context injected alongside the prompt,
+            e.g. a product name or category.
+        :param language: BCP-47 language code for the generated description.
+            Falls back to :func:`~viur.core.current.language.get` if not specified.
+        :returns: Plain-text ``alt`` attribute value rendered for the current
+            renderer.
+        :raises InternalServerError: If the skeleton is missing, no model is
+            configured, the provider does not support vision, or the LLM call fails.
+        :raises NotFound: If the file referenced by ``filekey`` does not exist.
         """
         if not (skel := self.getContents()):
             raise errors.InternalServerError(descr="Configuration missing")
@@ -281,10 +338,9 @@ class Assistant(Singleton):
                             "type": "image_url",
                             "image_url": {
                                 "url": f"data:image/jpeg;base64,{base64_image}",
+                                # "low" = 85 tokens, resize to < 512×512 px on the provider side.
+                                # See: https://platform.openai.com/docs/guides/images?api-mode=chat#calculating-costs
                                 "detail": "low",
-                                # "low" = 85 Tokens, "high" = calculated differently
-                                # "low" = resize (on OpenAI's side) to < 512x512px
-                                # https://platform.openai.com/docs/guides/images?api-mode=chat#calculating-costs
                             },
                         },
                     ],
@@ -296,21 +352,30 @@ class Assistant(Singleton):
 
         return self.render_text(result)
 
+    # ── Private utilities ────────────────────────────────────────────
+
     def _get_resized_image_bytes(
         self,
-        image: t.IO[bytes] | str | bytes | "os.PathLike[str]" | "os.PathLike[bytes]",
+        image: t.IO[bytes] | str | bytes | os.PathLike[str] | os.PathLike[bytes],
         target_pixel_count: int,
         jpeg_quality: int = 50,
-    ):
-        """
-        Resize an image to approximately match a target total pixel count and return it as a JPEG byte stream.
+    ) -> bytes:
+        """Resize an image proportionally and return it as a JPEG byte string.
 
-        :param image: Input image as file-like object, byte string, or file path.
-        :param target_pixel_count: Desired total pixel count (width × height).
-        :param jpeg_quality: JPEG compression quality (0–100). Default is 50.
-        :return: Resized JPEG image as bytes.
+        The image is scaled so that ``width × height ≈ target_pixel_count`` while
+        preserving the original aspect ratio.  If the computed dimensions would
+        exceed the original size, the image is returned unscaled (no upscaling).
 
-        :raises ValueError: If ``jpeg_quality`` is out of range or the image input is invalid.
+        PNG, SVG, and WEBP images are converted to RGB JPEG before resizing.
+
+        :param image: Source image as a file-like object or raw bytes.
+        :param target_pixel_count: Desired total pixel count (``width × height``).
+        :param jpeg_quality: JPEG compression quality from 0 (lowest) to 100
+            (highest). Defaults to 50 as a balance between file size and detail
+            sufficient for AI-based image analysis.
+        :returns: JPEG-encoded image bytes.
+        :raises ValueError: If ``jpeg_quality`` is outside the 0–100 range or
+            ``image`` is neither file-like nor bytes.
         """
         if not (0 <= jpeg_quality <= 100):
             raise ValueError("jpeg_quality must be between 0 and 100")
@@ -337,7 +402,7 @@ class Assistant(Singleton):
         else:
             resized_img = pillow_image.resize(
                 (new_width, new_height),
-                PIL.Image.Resampling.LANCZOS
+                PIL.Image.Resampling.LANCZOS,
             )
 
         result_bio = io.BytesIO()
@@ -346,10 +411,18 @@ class Assistant(Singleton):
         return result_bio.read()
 
     def render_text(self, text: str) -> t.Any:
-        """
-        Render the given text for the current renderer.
+        """Render a plain-text string for the current ViUR renderer.
+
+        Sets the appropriate ``Content-Type`` header and returns the text in the
+        format expected by the active renderer:
+
+        * **HTML renderer** – returns the text as-is with ``text/html`` content type.
+        * **JSON renderer** – returns the text JSON-encoded with
+          ``application/json`` content type.
 
         :param text: The text to render.
+        :returns: The text, optionally JSON-encoded.
+        :raises NotImplemented: If the current renderer is neither HTML nor JSON.
         """
         if utils.string.is_prefix(self.render.kind, "html"):
             current.request.get().response.headers["Content-Type"] = "text/html; charset=utf-8"

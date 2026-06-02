@@ -1,12 +1,39 @@
+"""
+OpenAI provider implementation for viur-assistant.
+
+Wraps the OpenAI Chat Completions API and maps its response fields to the
+normalised :class:`~base.CompletionResult`.
+
+Supported capabilities:
+
+* Text completions via ``gpt-*``, ``o1``, ``o3``, ``o4``, and ``chatgpt-*`` models.
+* Vision – ``image_url`` content parts are passed through unchanged (OpenAI accepts
+  the same data-URI format used in the canonical message schema).
+* JSON output – ``response_format={"type": "json_object"}`` is set when
+  ``response_format="json"``.
+
+.. note::
+   OpenAI does not provide a public "thinking" mode comparable to Anthropic's
+   extended thinking or Gemini's ``ThinkingConfig``.  Reasoning models (o1, o3,
+   o4) perform reasoning internally; ``max_thinking_tokens`` is ignored.
+"""
+
 from __future__ import annotations
 
 from .base import BaseProvider, CompletionResult, ModelInfo
 
-# Only chat-completion model prefixes; extend as OpenAI releases new series.
+# Prefixes of model IDs that support the Chat Completions API.
+# Extend this tuple as OpenAI releases new model series.
 _CHAT_PREFIXES = ("gpt-", "o1", "o3", "o4", "chatgpt-")
 
 
 class OpenAIProvider(BaseProvider):
+    """LLM provider backed by the OpenAI Chat Completions API.
+
+    Supports text and vision.  API key is read from
+    :attr:`~viur.assistant.config.AssistantConfig.api_openai_key`.
+    """
+
     def supports_vision(self) -> bool:
         return True
 
